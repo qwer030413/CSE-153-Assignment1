@@ -23,6 +23,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import f1_score, average_precision_score, accuracy_score
 import random
+from sklearn.ensemble import ExtraTreesClassifier
+
 
 def write_submission_predictions(predictions, outpath, normalize_audio_paths=False):
     # The autograder reads these files with eval(...), so write Python literals.
@@ -90,121 +92,344 @@ dataroot1 = r"C:\Users\Seojin Park\Desktop\Coding\CSE 153 Assignment1\student_fi
 class model1():
     def __init__(self):
         pass
+    
+    # helper functions
+    def safe_mean(self, values):
+        if len(values) == 0:
+            return 0.0
 
+        return float(np.mean(values))
+
+    def safe_std(self, values):
+        if len(values) == 0:
+            return 0.0
+
+        return float(np.std(values))
+
+    def normalized_hist(self, values, bins, range_):
+        hist, _ = np.histogram(values, bins=bins, range=range_)
+        hist = hist.astype(float)
+
+        total = np.sum(hist)
+
+        if total > 0:
+            hist = hist / total
+
+        return hist
+    
+    
+    
+    """
+        so for this one, we mostly use histograms instead of averages
+        the idea is that composer style is more about distributions
+        like what notes they use, what intervals they use, and what rhythms they use
+        
+        this is follwiong the piazza tips, PLS WORK
+        
+        combine histograms with the other features I had before
+        
+    """
     def features(self, path):
         midi_obj = miditoolkit.midi.parser.MidiFile(dataroot1 + '/' + path)
-        notes = midi_obj.instruments[0].notes
-        num_notes = len(notes)
-        average_pitch = sum([note.pitch for note in notes]) / num_notes
-        average_duration = sum([note.end - note.start for note in notes]) / num_notes
+        # notes = midi_obj.instruments[0].notes
+        # num_notes = len(notes)
+        # average_pitch = sum([note.pitch for note in notes]) / num_notes
+        # average_duration = sum([note.end - note.start for note in notes]) / num_notes
         
-        # pitch_classes = [0] * 12
-        # for note in notes:
-        #     pitch_classes[note.pitch % 12] += 1
-            
-        # #normalize first
-        # pitch_classes = [x / num_notes for x in pitch_classes]
-        # # more freatures
-        # std_pitch = np.sqrt(
-        #     sum([(note.pitch - average_pitch) ** 2 for note in notes]) / num_notes
-        # )
-        # std_duration = np.sqrt(
-        #     sum([((note.end - note.start) - average_duration) ** 2 for note in notes]) / num_notes
-        # )
         
-        #for convinience 
-        pitches = np.array([n.pitch for n in notes])
-        durations = np.array([n.end - n.start for n in notes])
-        starts = np.array([n.start for n in notes])
-        
-        avg_dur = np.mean(durations)
-        std_dur = np.std(durations)
-        num_notes = len(notes)
-        pitch_range = np.max(pitches) - np.min(pitches)
-        
-        pitch_classes = np.bincount(pitches % 12, minlength=12)
-        pitch_classes = pitch_classes / num_notes
-        
-        #melodic interval feats
-        if len(pitches) > 1:
-            intervals = np.diff(pitches)
-            abs_intervals = np.abs(intervals)
+        notes = []
 
-            interval_mean = np.mean(intervals)
-            interval_std = np.std(intervals)
-            abs_interval_mean = np.mean(abs_intervals)
-            abs_interval_std = np.std(abs_intervals)
-        else:
-            interval_mean = interval_std = abs_interval_mean = abs_interval_std = 0
+        # get notes from all non-drum instruments
+        # this is better than only using instruments[0]
+        for instrument in midi_obj.instruments:
+            if not instrument.is_drum:
+                notes.extend(instrument.notes)
+
+        if len(notes) == 0:
+            for instrument in midi_obj.instruments:
+                notes.extend(instrument.notes)
+
+        if len(notes) == 0:
+            return [0.0] * 371
+
+        # sort notes so intervals actually follow the melody/order
+        notes = sorted(notes, key=lambda note: (note.start, note.pitch))
+
+        pitches = np.array([note.pitch for note in notes])
+        durations = np.array([note.end - note.start for note in notes])
+        velocities = np.array([note.velocity for note in notes])
+        starts = np.array([note.start for note in notes])
+        ends = np.array([note.end for note in notes])
         
-        
-        #histogram feature
-        interval_hist, z = np.histogram(
-            np.clip(intervals if len(pitches) > 1 else [0], -12, 12),
-            bins=12,
-            range=(-12, 12),
-            density=True
+        # just making sure there are no 0 duration notes
+        durations = np.maximum(durations, 1)
+        total_time = np.max(ends) - np.min(starts)
+        num_notes = len(notes)
+        if total_time <= 0:
+            total_time = 1
+            
+            
+            
+        features = []
+        features += [
+            num_notes,
+            num_notes / total_time,
+
+            self.safe_mean(pitches),
+            self.safe_std(pitches),
+            np.max(pitches) - np.min(pitches),
+
+            self.safe_mean(durations),
+            self.safe_std(durations),
+
+            self.safe_mean(velocities),
+            self.safe_std(velocities),
+        ]
+        # chroma histogram
+        # this is pitch class, so c, c#, d, etc.
+        # this is probably one of the most useful features for composers
+        pitch_classes = pitches % 12
+
+        chroma_hist = np.bincount(pitch_classes, minlength=12)
+        chroma_hist = chroma_hist.astype(float)
+
+        if np.sum(chroma_hist) > 0:
+            chroma_hist = chroma_hist / np.sum(chroma_hist)
+
+        features += chroma_hist.tolist()
+
+        #pitch histogram
+        #this keeps track of the general register of the piece
+        #like whether the piece uses low notes or high notes more often
+        pitch_hist = self.normalized_hist(
+            pitches,
+            bins=32,
+            range_=(0, 128)
         )
+
+        features += pitch_hist.tolist()
+
+        # duration histogram
+        #this is for rhythm, like short notes vs long notes
+        clipped_durations = np.clip(durations, 0, 4096)
+
+        duration_hist = self.normalized_hist(
+            clipped_durations,
+            bins=16,
+            range_=(0, 4096)
+        )
+
+        features += duration_hist.tolist()
+
+        # log duration histogram
+        log_durations = np.log1p(durations)
+
+        log_duration_hist = self.normalized_hist(
+            log_durations,
+            bins=16,
+            range_=(0, np.log1p(4096))
+        )
+        features += log_duration_hist.tolist()
         
-        
-        
-        # timing
-        onsets = [0]
-        if len(starts) > 1:
-            onsets = np.diff(np.sort(starts))
-        onset_mean = 0
-        onset_std = 0
-        if len(onsets):
-            onset_mean = np.mean(onsets)
-            onset_std = np.std(onsets)
-        
-        
-        # temportal seg, idk if this even makes a diff T_T
-        t_min, t_max = np.min(starts), np.max(starts)
-        thirds = np.linspace(t_min, t_max + 1e-6, 4)
-        
-        segment_feats = []
-        for i in range(3):
-            mask = (starts >= thirds[i]) & (starts < thirds[i+1])
-            if np.sum(mask) > 0:
-                seg_pitches = pitches[mask]
-                segment_feats += [
-                    np.mean(seg_pitches),
-                    np.std(seg_pitches),
-                    len(seg_pitches)
-                ]
+        # velocity histogram
+        # velocity is kind of like how hard/loud the note is played
+        velocity_hist = self.normalized_hist(
+            velocities,
+            bins=16,
+            range_=(0, 128)
+        )
+
+        features += velocity_hist.tolist()
+
+        # make a simple melody line
+        # this is new because intervals from all notes can get noisy
+        # if a chord has multiple notes, we only keep the highest note at that time
+        melody_dict = {}
+
+        for note in notes:
+            if note.start not in melody_dict:
+                melody_dict[note.start] = note.pitch
             else:
-                segment_feats += [0, 0, 0]
-                
-                
-                
-                
-                
-                
-                
-                
-                
-        features = np.concatenate([
-            pitch_classes,
-            interval_hist,
-            [
-                onset_mean,
-                onset_std,
-                avg_dur,
-                std_dur,
-                num_notes,
-                pitch_range,
-                interval_mean,
-                average_pitch,
-                average_duration,
-                interval_std,
-                abs_interval_mean,
-                abs_interval_std
-            ],
-            segment_feats
-        ])
+                if note.pitch > melody_dict[note.start]:
+                    melody_dict[note.start] = note.pitch
+
+        melody_starts = sorted(melody_dict.keys())
+        melody_pitches = []
+
+        for start_time in melody_starts:
+            melody_pitches.append(melody_dict[start_time])
+
+        melody_pitches = np.array(melody_pitches)
+
+        # interval histogram
+        # this is really important because it captures how notes move
+        if len(melody_pitches) > 1:
+            intervals = np.diff(melody_pitches)
+        else:
+            intervals = np.array([0])
+
+        clipped_intervals = np.clip(intervals, -24, 24)
+
+        interval_hist = self.normalized_hist(
+            clipped_intervals,
+            bins=24,
+            range_=(-24, 24)
+        )
+
+        features += interval_hist.tolist()
+
+        # absolute interval histogram
+        # same as intervals, but we ignore direction
+        # so going up 5 and down 5 are treated similarly
+        absolute_intervals = np.abs(intervals)
+        clipped_absolute_intervals = np.clip(absolute_intervals, 0, 24)
+
+        absolute_interval_hist = self.normalized_hist(
+            clipped_absolute_intervals,
+            bins=8,
+            range_=(0, 24)
+        )
+
+        features += absolute_interval_hist.tolist()
+
+        # interval class histogram
+        # it can capture common musical movement patterns
+        interval_classes = intervals % 12
+
+        interval_class_hist = np.bincount(interval_classes, minlength=12)
+        interval_class_hist = interval_class_hist.astype(float)
+
+        if np.sum(interval_class_hist) > 0:
+            interval_class_hist = interval_class_hist / np.sum(interval_class_hist)
+
+        features += interval_class_hist.tolist()
+
+        # chroma transition matrix
+        # this is basically a histogram of note movements
+        # like c to g, d to a, etc.
+        # i think this might help because composers can have different movement patterns
+        transition_matrix = np.zeros((12, 12))
+
+        melody_pitch_classes = melody_pitches % 12
+
+        if len(melody_pitch_classes) > 1:
+            for i in range(len(melody_pitch_classes) - 1):
+                previous_class = int(melody_pitch_classes[i])
+                next_class = int(melody_pitch_classes[i + 1])
+
+                transition_matrix[previous_class][next_class] += 1
+
+        transition_total = np.sum(transition_matrix)
+
+        if transition_total > 0:
+            transition_matrix = transition_matrix / transition_total
+
+        features += transition_matrix.flatten().tolist()
+
+        
+        #onset gap hist
+        unique_starts = sorted(set(starts))
+
+        if len(unique_starts) > 1:
+            onset_gaps = np.diff(unique_starts)
+        else:
+            onset_gaps = np.array([0])
+
+        clipped_onset_gaps = np.clip(onset_gaps, 0, 4096)
+
+        onset_gap_hist = self.normalized_hist(
+            clipped_onset_gaps,
+            bins=16,
+            range_=(0, 4096)
+        )
+
+        features += onset_gap_hist.tolist()
+        features += [
+            self.safe_mean(onset_gaps),
+            self.safe_std(onset_gaps),
+        ]
+        
+        
+        
+        # polyphony / chord size features
+        # this checks how many notes start at the same time
+        start_counts = {}
+
+        for start_time in starts:
+            if start_time not in start_counts:
+                start_counts[start_time] = 0
+
+            start_counts[start_time] += 1
+
+        chord_sizes = np.array(list(start_counts.values()))
+
+        chord_size_hist = self.normalized_hist(
+            np.clip(chord_sizes, 1, 8),
+            bins=8,
+            range_=(1, 9)
+        )
+        features += chord_size_hist.tolist()
+        features += [
+            self.safe_mean(chord_sizes),
+            self.safe_std(chord_sizes),
+            np.max(chord_sizes),
+            np.mean(chord_sizes >= 2),
+            np.mean(chord_sizes >= 3),
+        ]
+        
+        # temporal split
+        # this gives a tiny bit of structure across the piece
+        min_start = np.min(starts)
+        max_start = np.max(starts)
+
+        if max_start == min_start:
+            segment_edges = np.linspace(min_start, min_start + 1, 4)
+        else:
+            segment_edges = np.linspace(min_start, max_start + 1e-6, 4)
+
+        for i in range(3):
+            segment_start = segment_edges[i]
+            segment_end = segment_edges[i + 1]
+
+            mask = (starts >= segment_start) & (starts < segment_end)
+
+            if np.sum(mask) > 0:
+                segment_pitches = pitches[mask]
+                segment_durations = durations[mask]
+                segment_pitch_classes = pitch_classes[mask]
+
+                segment_chroma = np.bincount(segment_pitch_classes, minlength=12)
+                segment_chroma = segment_chroma.astype(float)
+
+                if np.sum(segment_chroma) > 0:
+                    segment_chroma = segment_chroma / np.sum(segment_chroma)
+
+                features += segment_chroma.tolist()
+
+                features += [
+                    len(segment_pitches) / num_notes,
+                    self.safe_mean(segment_pitches),
+                    self.safe_std(segment_pitches),
+                    self.safe_mean(segment_durations),
+                    self.safe_std(segment_durations),
+                ]
+
+            else:
+                features += [0.0] * 12
+                features += [0.0] * 5
+        
+        features = np.array(features, dtype=float)
+
+        features = np.nan_to_num(
+            features,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0
+        )
 
         return features.tolist()
+
+
 
     def predict(self, path, outpath=None):
         d = eval(open(path, 'r').read())
@@ -244,18 +469,106 @@ class model2():
         midi_obj = miditoolkit.midi.parser.MidiFile(dataroot2 + '/' + path)
         notes = midi_obj.instruments[0].notes
         
-        min_tick = min([note.start for note in notes])
-        max_tick = max([note.start for note in notes])
-        notes_with_min_tick = [note.pitch for note in notes if note.start == min_tick]
-        notes_with_max_tick = [note.pitch for note in notes if note.start == max_tick]
-        avg_pitch_min_tick = sum(notes_with_min_tick) / len(notes_with_min_tick)
-        avg_pitch_max_tick = sum(notes_with_max_tick) / len(notes_with_max_tick)
-        return avg_pitch_min_tick, avg_pitch_max_tick
+        # samething as before so its easier for new feats
+        pitches = np.array([n.pitch for n in notes])
+        starts = np.array([n.start for n in notes])
+        durations = np.array([n.end - n.start for n in notes])
+        pitch_mean = 0
+        pitch_std = 0
+        pitch_range = 0
+
+        duration_mean = 0
+        duration_std = 0
+
+        density = len(notes)
+
+        interval_mean = 0
+        interval_std = 0
+
+        start_mean = 0
+        end_mean = 0
+        start_std = 0
+        end_std = 0
+        
+        
+        # min_tick = min([note.start for note in notes])
+        # max_tick = max([note.start for note in notes])
+        # notes_with_min_tick = [note.pitch for note in notes if note.start == min_tick]
+        # notes_with_max_tick = [note.pitch for note in notes if note.start == max_tick]
+        # avg_pitch_min_tick = sum(notes_with_min_tick) / len(notes_with_min_tick)
+        # avg_pitch_max_tick = sum(notes_with_max_tick) / len(notes_with_max_tick)
+        
+        duration_mean = np.mean(durations)
+        duration_std = np.std(durations)
+        
+        
+        # global basic things
+        if len(notes) > 0:
+            pitch_mean = np.mean(pitches)
+            pitch_std = np.std(pitches)
+            pitch_range = np.max(pitches) - np.min(pitches)
+
+            duration_mean = np.mean(durations)
+            duration_std = np.std(durations)
+
+            # boundary structure
+            first_q = np.percentile(starts, 25)
+            last_q = np.percentile(starts, 75)
+
+            start_group = pitches[starts <= first_q]
+            end_group = pitches[starts >= last_q]
+
+            if len(start_group) > 0:
+                start_mean = np.mean(start_group)
+                start_std = np.std(start_group)
+
+            if len(end_group) > 0:
+                end_mean = np.mean(end_group)
+                end_std = np.std(end_group)
+
+            # intervals
+            if len(notes) > 1:
+                intervals = np.diff(pitches)
+                interval_mean = np.mean(intervals)
+                interval_std = np.std(intervals)
+
+        return np.array([
+            pitch_mean,
+            pitch_std,
+            pitch_range,
+            duration_mean,
+            duration_std,
+            density,
+            start_mean,
+            end_mean,
+            start_std,
+            end_std,
+            interval_mean,
+            interval_std
+        ])
+        
 
     def train(self, path):
         # This baseline doesn't use any model (it just measures pitch difference)
         # You can use this approach but *probably* you'll want to implement a model
-        pass
+        # pass
+        
+        #ALWAYS TRAIN
+        d = eval(open(path, 'r').read())
+        predictions = {}
+        for k in tqdm(d):
+            path1, path2 = k
+
+            f1 = self.features(path1)
+            f2 = self.features(path2)
+
+            diff = (f1 - f2).reshape(1, -1)
+
+            pred = self.model.predict(diff)[0]
+            predictions[k] = bool(pred)
+
+        return predictions
+    
 
     def predict(self, path, outpath=None):
         d = eval(open(path, 'r').read())
